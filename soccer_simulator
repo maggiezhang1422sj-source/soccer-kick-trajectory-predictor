@@ -1,0 +1,1635 @@
+#!/usr/bin/env python3
+"""
+Panda3D soccer ball FPV simulator.
+
+The app waits for UDP packets from an ESP32 kick sensor. When a packet with a
+kicked flag arrives, it animates a soccer ball shot toward the goal with a close
+following camera.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import queue
+import random
+import socket
+import struct
+import threading
+import time
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+from direct.gui.DirectGui import DirectButton, DirectFrame, DirectLabel
+from direct.showbase.ShowBase import ShowBase
+from direct.showbase.ShowBaseGlobal import globalClock
+from panda3d.core import (
+    AmbientLight,
+    CardMaker,
+    DirectionalLight,
+    Geom,
+    GeomNode,
+    GeomTriangles,
+    GeomVertexData,
+    GeomVertexFormat,
+    GeomVertexWriter,
+    LineSegs,
+    Material,
+    NodePath,
+    PNMImage,
+    TextNode,
+    Texture,
+    TransparencyAttrib,
+    Vec3,
+    WindowProperties,
+)
+
+
+UDP_PORT = 4210
+FIELD_LENGTH = 105.0
+FIELD_WIDTH = 68.0
+GOAL_X = FIELD_LENGTH / 2.0
+GOAL_WIDTH = 7.32
+GOAL_HEIGHT = 2.44
+GOAL_NET_DEPTH = 2.0
+GOAL_NET_BACK_X = GOAL_X + GOAL_NET_DEPTH
+BALL_RADIUS = 0.22
+GRAVITY = 9.81
+
+
+@dataclass
+class ShotData:
+    speed_mps: float
+    launch_angle_deg: float
+    direction_deg: float = 0.0
+    spin_rpm: float = 0.0
+    side_spin_rpm: float = 0.0
+    ball_distance_m: Optional[float] = None
+    ball_position_angle_deg: Optional[float] = None
+    direction_relative_to_goal: bool = False
+
+
+class UdpKickListener(threading.Thread):
+    def __init__(self, out_queue: queue.Queue[ShotData], debug_queue: queue.Queue[str], port: int = UDP_PORT):
+        super().__init__(daemon=True)
+        self.out_queue = out_queue
+        self.debug_queue = debug_queue
+        self.port = port
+        self._stop_event = threading.Event()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        self._sock.bind(("0.0.0.0", self.port))
+        self._sock.settimeout(0.25)
+        self._chunked_sensor_packets: dict[int, dict] = {}
+        self._completed_sequences: dict[int, float] = {}
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                payload, _addr = self._sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            magic = payload[:4].decode("ascii", errors="replace")
+            self._debug(f"RX {len(payload)} bytes magic={magic!r}")
+            shot = self._parse_payload(payload)
+            if shot:
+                self.out_queue.put(shot)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._sock.close()
+
+    def _debug(self, message: str) -> None:
+        try:
+            self.debug_queue.put_nowait(message)
+        except queue.Full:
+            pass
+
+    def _parse_payload(self, payload: bytes) -> Optional[ShotData]:
+        if payload.startswith(b"SKC1"):
+            return self._shot_from_chunked_binary_sensor_buffer(payload)
+        if payload.startswith(b"SKB1"):
+            return UdpKickListener._shot_from_binary_sensor_buffer(payload)
+        return UdpKickListener._parse_packet(payload.decode("utf-8", errors="replace").strip())
+
+    @staticmethod
+    def _parse_packet(text: str) -> Optional[ShotData]:
+        try:
+            data = json.loads(text)
+            if not data.get("kicked", data.get("ball_kicked", True)):
+                return None
+            if data.get("type") == "sensor_buffer" or "samples" in data:
+                return UdpKickListener._shot_from_sensor_buffer(data)
+            return ShotData(
+                speed_mps=float(data.get("speed_mps", 20.0)),
+                launch_angle_deg=float(data.get("launch_angle_deg", 16.0)),
+                direction_deg=float(data.get("direction_deg", data.get("azimuth_deg", 0.0))),
+                spin_rpm=float(data.get("spin_rpm", 0.0)),
+                side_spin_rpm=float(data.get("side_spin_rpm", 0.0)),
+                ball_distance_m=float(data["ball_distance_m"]) if "ball_distance_m" in data else None,
+                ball_position_angle_deg=float(data["ball_position_angle_deg"]) if "ball_position_angle_deg" in data else None,
+            )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        try:
+            parts = [float(part.strip()) for part in text.split(",")]
+            if len(parts) >= 2:
+                return ShotData(
+                    speed_mps=parts[0],
+                    launch_angle_deg=parts[1],
+                    direction_deg=parts[2] if len(parts) > 2 else 0.0,
+                    spin_rpm=parts[3] if len(parts) > 3 else 0.0,
+                    side_spin_rpm=parts[4] if len(parts) > 4 else 0.0,
+                    ball_distance_m=parts[5] if len(parts) > 5 else None,
+                    ball_position_angle_deg=parts[6] if len(parts) > 6 else None,
+                )
+        except ValueError:
+            return None
+        return None
+
+    @staticmethod
+    def _shot_from_sensor_buffer(data: dict) -> Optional[ShotData]:
+        samples = UdpKickListener._decode_sensor_samples(data)
+        distance = float(data["ball_distance_m"]) if "ball_distance_m" in data else None
+        angle = float(data["ball_position_angle_deg"]) if "ball_position_angle_deg" in data else None
+        return UdpKickListener._shot_from_sensor_samples(samples, distance, angle)
+
+    @staticmethod
+    def _shot_from_binary_sensor_buffer(payload: bytes) -> Optional[ShotData]:
+        header_format = "<4sHHHHHhh"
+        header_size = struct.calcsize(header_format)
+        base_format = "<11i"
+        base_size = struct.calcsize(base_format)
+        delta_format = "<11h"
+        delta_size = struct.calcsize(delta_format)
+        if len(payload) < header_size + base_size:
+            return None
+
+        try:
+            magic, sample_count, _sample_hz, accel_scale, gyro_scale, _fsr_threshold, _motion_speed, _motion_accel = struct.unpack_from(
+                header_format, payload, 0
+            )
+            if magic != b"SKB1" or sample_count <= 0:
+                return None
+            expected_size = header_size + base_size + max(0, sample_count - 1) * delta_size
+            if len(payload) < expected_size:
+                return None
+
+            offset = header_size
+            current = list(struct.unpack_from(base_format, payload, offset))
+            offset += base_size
+            samples = [UdpKickListener._decode_quantized_sample(current, float(accel_scale), float(gyro_scale))]
+            for _ in range(sample_count - 1):
+                delta = struct.unpack_from(delta_format, payload, offset)
+                offset += delta_size
+                current = [current[i] + int(delta[i]) for i in range(11)]
+                samples.append(UdpKickListener._decode_quantized_sample(current, float(accel_scale), float(gyro_scale)))
+        except (struct.error, ZeroDivisionError):
+            return None
+
+        return UdpKickListener._shot_from_sensor_samples(samples, None, None)
+
+    def _shot_from_chunked_binary_sensor_buffer(self, payload: bytes) -> Optional[ShotData]:
+        header_format = "<4sHBBHHHHHHHhh"
+        header_size = struct.calcsize(header_format)
+        base_format = "<11i"
+        base_size = struct.calcsize(base_format)
+        delta_format = "<11h"
+        delta_size = struct.calcsize(delta_format)
+        if len(payload) < header_size + base_size:
+            return None
+
+        try:
+            (
+                magic,
+                sequence_id,
+                chunk_index,
+                chunk_count,
+                sample_count,
+                start_sample,
+                row_count,
+                _sample_hz,
+                accel_scale,
+                gyro_scale,
+                _fsr_threshold,
+                _motion_speed,
+                _motion_accel,
+            ) = struct.unpack_from(header_format, payload, 0)
+            if magic != b"SKC1" or sample_count <= 0 or row_count <= 0 or chunk_count <= 0:
+                return None
+            expected_size = header_size + base_size + max(0, row_count - 1) * delta_size
+            if len(payload) < expected_size:
+                return None
+
+            offset = header_size
+            current = list(struct.unpack_from(base_format, payload, offset))
+            offset += base_size
+            rows = [UdpKickListener._decode_quantized_sample(current, float(accel_scale), float(gyro_scale))]
+            for _ in range(row_count - 1):
+                delta = struct.unpack_from(delta_format, payload, offset)
+                offset += delta_size
+                current = [current[i] + int(delta[i]) for i in range(11)]
+                rows.append(UdpKickListener._decode_quantized_sample(current, float(accel_scale), float(gyro_scale)))
+        except (struct.error, ZeroDivisionError):
+            return None
+
+        now = time.time()
+        for completed_sequence in [
+            seq for seq, completed_at in self._completed_sequences.items() if now - completed_at > 4.0
+        ]:
+            del self._completed_sequences[completed_sequence]
+        if sequence_id in self._completed_sequences:
+            return None
+
+        for stale_sequence in [
+            seq for seq, packet in self._chunked_sensor_packets.items() if now - packet["updated_at"] > 4.0
+        ]:
+            del self._chunked_sensor_packets[stale_sequence]
+
+        packet = self._chunked_sensor_packets.setdefault(
+            sequence_id,
+            {
+                "sample_count": sample_count,
+                "chunk_count": chunk_count,
+                "chunks": {},
+                "updated_at": now,
+            },
+        )
+        packet["updated_at"] = now
+        packet["chunks"][start_sample] = rows
+
+        received_rows = sum(len(chunk_rows) for chunk_rows in packet["chunks"].values())
+        self._debug(
+            f"Chunk {chunk_index + 1}/{chunk_count} seq={sequence_id} rows={received_rows}/{sample_count}"
+        )
+        if len(packet["chunks"]) < chunk_count or received_rows < sample_count:
+            return None
+
+        samples = []
+        for start in sorted(packet["chunks"]):
+            samples.extend(packet["chunks"][start])
+        del self._chunked_sensor_packets[sequence_id]
+        self._completed_sequences[sequence_id] = now
+        complete_message = f"Complete sensor buffer: {len(samples[:sample_count])} samples in {chunk_count} chunks"
+        self._debug(complete_message)
+        print(complete_message)
+        return UdpKickListener._shot_from_sensor_samples(samples[:sample_count], None, None)
+
+    @staticmethod
+    def _shot_from_sensor_samples(
+        samples: list[list[float]], distance: Optional[float], angle: Optional[float]
+    ) -> Optional[ShotData]:
+        if not samples:
+            return None
+
+        fsr_rows = [row[1:5] for row in samples]
+        accel_rows = [row[5:8] for row in samples]
+        gyro_rows = [row[8:11] for row in samples]
+        baseline_count = max(1, min(5, len(samples)))
+        fsr_baseline = [
+            sum(row[i] for row in fsr_rows[:baseline_count]) / baseline_count
+            for i in range(4)
+        ]
+        total_baseline = sum(fsr_baseline)
+        fsr_totals = [sum(row) for row in fsr_rows]
+        peak_index = max(range(len(fsr_totals)), key=fsr_totals.__getitem__)
+        peak_fsr = fsr_rows[peak_index]
+        peak_total = fsr_totals[peak_index]
+        fsr_signal = [max(0.0, peak_fsr[i] - fsr_baseline[i]) for i in range(4)]
+        signal_total = max(1.0, sum(fsr_signal), peak_total - total_baseline)
+
+        accel_mags = [math.sqrt(ax * ax + ay * ay + az * az) for ax, ay, az in accel_rows]
+        rest_accel = sum(accel_mags[:baseline_count]) / baseline_count
+        peak_dynamic_accel = max(abs(mag - rest_accel) for mag in accel_mags)
+        peak_accel = accel_rows[max(range(len(accel_mags)), key=lambda i: abs(accel_mags[i] - rest_accel))]
+        peak_gyro = gyro_rows[peak_index]
+
+        left_pressure = fsr_signal[0] + fsr_signal[2]
+        right_pressure = fsr_signal[1] + fsr_signal[3]
+        upper_pressure = fsr_signal[0] + fsr_signal[1]
+        lower_pressure = fsr_signal[2] + fsr_signal[3]
+        side_bias = (right_pressure - left_pressure) / signal_total
+        vertical_bias = (upper_pressure - lower_pressure) / signal_total
+
+        pressure_norm = UdpKickListener._clamp((peak_total - total_baseline) / 8500.0, 0.0, 1.0)
+        accel_norm = UdpKickListener._clamp(peak_dynamic_accel / 28.0, 0.0, 1.0)
+        speed_mps = UdpKickListener._clamp(6.0 + pressure_norm * 28.0 + accel_norm * 22.0, 5.0, 55.0)
+        launch_angle = UdpKickListener._clamp(
+            14.0 + vertical_bias * 14.0 + UdpKickListener._clamp(peak_accel[2] / 35.0, -1.0, 1.0) * 5.0,
+            5.0,
+            38.0,
+        )
+
+        goal_direction = UdpKickListener._goal_direction_from_distance_angle(distance, angle)
+        direction = UdpKickListener._clamp(goal_direction + side_bias * 22.0 + peak_gyro[2] * 0.08, -180.0, 180.0)
+        spin_rpm = UdpKickListener._clamp(450.0 + abs(vertical_bias) * 1500.0 + abs(peak_gyro[1]) * 12.0, -2500.0, 2500.0)
+        side_spin_rpm = UdpKickListener._clamp(side_bias * 1900.0 + peak_gyro[2] * 18.0, -2500.0, 2500.0)
+
+        return ShotData(
+            speed_mps=speed_mps,
+            launch_angle_deg=launch_angle,
+            direction_deg=direction,
+            spin_rpm=spin_rpm,
+            side_spin_rpm=side_spin_rpm,
+            ball_distance_m=distance,
+            ball_position_angle_deg=angle,
+            direction_relative_to_goal=distance is None or angle is None,
+        )
+
+    @staticmethod
+    def _decode_sensor_samples(data: dict) -> list[list[float]]:
+        if data.get("encoding") == "delta":
+            base = data.get("base")
+            deltas = data.get("deltas", [])
+            if not isinstance(base, list) or len(base) < 11:
+                return []
+
+            accel_scale = float(data.get("accel_scale", 100.0))
+            gyro_scale = float(data.get("gyro_scale", 10.0))
+            samples = []
+            try:
+                current = [int(value) for value in base[:11]]
+                samples.append(UdpKickListener._decode_quantized_sample(current, accel_scale, gyro_scale))
+                for row in deltas:
+                    if not isinstance(row, list) or len(row) < 11:
+                        continue
+                    diff = [int(value) for value in row[:11]]
+                    current = [current[i] + diff[i] for i in range(11)]
+                    samples.append(UdpKickListener._decode_quantized_sample(current, accel_scale, gyro_scale))
+            except (TypeError, ValueError, ZeroDivisionError):
+                return []
+            return samples
+
+        samples = []
+        for row in data.get("samples", []):
+            if not isinstance(row, list) or len(row) < 11:
+                continue
+            try:
+                samples.append([float(value) for value in row[:11]])
+            except (TypeError, ValueError):
+                continue
+        return samples
+
+    @staticmethod
+    def _decode_quantized_sample(row: list[int], accel_scale: float, gyro_scale: float) -> list[float]:
+        return [
+            float(row[0]),
+            float(row[1]),
+            float(row[2]),
+            float(row[3]),
+            float(row[4]),
+            row[5] / accel_scale,
+            row[6] / accel_scale,
+            row[7] / accel_scale,
+            row[8] / gyro_scale,
+            row[9] / gyro_scale,
+            row[10] / gyro_scale,
+        ]
+
+    @staticmethod
+    def _goal_direction_from_distance_angle(distance_m: Optional[float], angle_deg: Optional[float]) -> float:
+        if distance_m is None or angle_deg is None:
+            return 0.0
+        angle = math.radians(angle_deg)
+        ball_x = GOAL_X - math.sin(angle) * distance_m
+        ball_y = -math.cos(angle) * distance_m
+        return math.degrees(math.atan2(-ball_y, GOAL_X - ball_x))
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+
+class SoccerFpvSimulator(ShowBase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.disableMouse()
+        self.setBackgroundColor(0.45, 0.72, 0.98, 1.0)
+
+        props = WindowProperties()
+        props.setTitle("ESP32 Soccer Kick FPV Simulator")
+        props.setSize(1280, 800)
+        if self.win:
+            self.win.requestProperties(props)
+
+        self.shot_queue: queue.Queue[ShotData] = queue.Queue()
+        self.udp_debug_queue: queue.Queue[str] = queue.Queue(maxsize=64)
+        self.listener: Optional[UdpKickListener] = None
+        self.udp_error = ""
+        try:
+            self.listener = UdpKickListener(self.shot_queue, self.udp_debug_queue)
+            self.listener.start()
+        except OSError as exc:
+            self.udp_error = str(exc)
+
+        self.ball = self._make_soccer_ball()
+        self.ball.reparentTo(self.render)
+        self.direction_line_np: Optional[NodePath] = None
+        self.trajectory_line_np: Optional[NodePath] = None
+        self.clouds: list[NodePath] = []
+        self.birds: list[NodePath] = []
+
+        self.velocity = Vec3(0, 0, 0)
+        self.flight_time = 0.0
+        self.previous_ball_pos = Vec3(0, 0, 0)
+        self.shot_active = False
+        self.goal_line_passed = False
+        self.ball_landed = False
+        self.goal_crossing_was_goal = False
+        self.goal_scored = False
+        self.net_contacted = False
+        self.replay_active = False
+        self.replay_started_at = 0.0
+        self.replay_draw_index = 0
+        self.replay_draw_progress = 0.0
+        self.trajectory_points: list[Vec3] = []
+        self.last_shot: Optional[ShotData] = None
+        self.status_since = time.time()
+        self.goal_result = ""
+        self.random_loop_enabled = False
+        self.next_random_shot_at = time.time() + 1.0
+        self.shot_distance_choices = [
+            ("10 m", 10.0),
+            ("20 m", 20.0),
+            ("30 m", 30.0),
+            ("40 m", 40.0),
+            ("50 m", 50.0),
+            ("75 m", 75.0),
+            ("100 m", 100.0),
+        ]
+        self.shot_angle_choices = [
+            ("0 deg", 0.0),
+            ("30 deg", 30.0),
+            ("60 deg", 60.0),
+            ("90 deg", 90.0),
+            ("120 deg", 120.0),
+            ("150 deg", 150.0),
+            ("180 deg", 180.0),
+        ]
+        self.shot_distance_index = 0
+        self.shot_angle_index = 3
+        self.shot_distance_m = self.shot_distance_choices[self.shot_distance_index][1]
+        self.shot_angle_deg = self.shot_angle_choices[self.shot_angle_index][1]
+        self.ball_start_pos = self._ball_position_from_selected_controls()
+        self.ball.setPos(self.ball_start_pos)
+
+        self._build_world()
+        self._build_lights()
+        self._build_gui()
+        self._reset_camera()
+        self._update_direction_indicator(self._direction_from_ball_to_goal(self.ball_start_pos))
+
+        self.accept("escape", self.userExit)
+        self.accept("d", self._demo_shot)
+        self.accept("a", self._toggle_random_loop)
+        self.accept("r", self._reset_ball)
+        self.accept("[", self._cycle_shot_distance, [-1])
+        self.accept("]", self._cycle_shot_distance, [1])
+        self.accept(",", self._cycle_shot_angle, [-1])
+        self.accept(".", self._cycle_shot_angle, [1])
+        self.taskMgr.add(self._update, "update")
+
+    def destroy(self) -> None:
+        if self.listener:
+            self.listener.stop()
+        super().destroy()
+
+    def _build_gui(self) -> None:
+        self.ui = DirectFrame(
+            frameColor=(0.02, 0.06, 0.08, 0.72),
+            frameSize=(-1.32, 1.32, -0.96, -0.66),
+            pos=(0, 0, 0),
+        )
+        self.status_label = DirectLabel(
+            parent=self.ui,
+            text=self._waiting_status_text(),
+            text_fg=(1, 1, 1, 1),
+            text_scale=0.055,
+            text_align=TextNode.ALeft,
+            frameColor=(0, 0, 0, 0),
+            pos=(-1.25, 0, -0.735),
+        )
+        self.telemetry_label = DirectLabel(
+            parent=self.ui,
+            text=f"UDP :{UDP_PORT}   Speed -- m/s   Launch -- deg   Dir -- deg   Spin -- rpm",
+            text_fg=(0.78, 0.94, 1, 1),
+            text_scale=0.04,
+            text_align=TextNode.ALeft,
+            frameColor=(0, 0, 0, 0),
+            pos=(-1.25, 0, -0.925),
+        )
+        self._build_shot_controls()
+        DirectButton(
+            parent=self.ui,
+            text="Demo Shot",
+            text_scale=0.04,
+            frameColor=(0.10, 0.46, 0.28, 1),
+            text_fg=(1, 1, 1, 1),
+            relief=1,
+            scale=(0.50, 1, 0.36),
+            pos=(0.61, 0, -0.76),
+            command=self._demo_shot,
+        )
+        self.random_button = DirectButton(
+            parent=self.ui,
+            text="UDP Listen",
+            text_scale=0.04,
+            frameColor=(0.13, 0.30, 0.54, 1),
+            text_fg=(1, 1, 1, 1),
+            relief=1,
+            scale=(0.56, 1, 0.36),
+            pos=(0.96, 0, -0.76),
+            command=self._toggle_random_loop,
+        )
+        DirectButton(
+            parent=self.ui,
+            text="Reset",
+            text_scale=0.04,
+            frameColor=(0.12, 0.18, 0.24, 1),
+            text_fg=(1, 1, 1, 1),
+            relief=1,
+            scale=(0.42, 1, 0.36),
+            pos=(1.25, 0, -0.76),
+            command=self._reset_ball,
+        )
+
+    def _build_shot_controls(self) -> None:
+        DirectLabel(
+            parent=self.ui,
+            text="Shot",
+            text_fg=(1, 1, 1, 1),
+            text_scale=0.036,
+            text_align=TextNode.ALeft,
+            frameColor=(0, 0, 0, 0),
+            pos=(-0.16, 0, -0.735),
+        )
+        DirectButton(
+            parent=self.ui,
+            text="<",
+            text_scale=0.045,
+            frameColor=(0.12, 0.18, 0.24, 1),
+            text_fg=(1, 1, 1, 1),
+            relief=1,
+            scale=(0.17, 1, 0.28),
+            pos=(-0.02, 0, -0.735),
+            command=self._cycle_shot_distance,
+            extraArgs=[-1],
+        )
+        self.distance_label = DirectLabel(
+            parent=self.ui,
+            text=self.shot_distance_choices[self.shot_distance_index][0],
+            text_fg=(0.78, 0.94, 1, 1),
+            text_scale=0.032,
+            frameColor=(0, 0, 0, 0),
+            pos=(0.16, 0, -0.735),
+        )
+        DirectButton(
+            parent=self.ui,
+            text=">",
+            text_scale=0.045,
+            frameColor=(0.12, 0.18, 0.24, 1),
+            text_fg=(1, 1, 1, 1),
+            relief=1,
+            scale=(0.17, 1, 0.28),
+            pos=(0.36, 0, -0.735),
+            command=self._cycle_shot_distance,
+            extraArgs=[1],
+        )
+        DirectLabel(
+            parent=self.ui,
+            text="Aim",
+            text_fg=(0.78, 0.94, 1, 1),
+            text_scale=0.032,
+            text_align=TextNode.ALeft,
+            frameColor=(0, 0, 0, 0),
+            pos=(-0.16, 0, -0.845),
+        )
+        DirectButton(
+            parent=self.ui,
+            text="<",
+            text_scale=0.045,
+            frameColor=(0.12, 0.18, 0.24, 1),
+            text_fg=(1, 1, 1, 1),
+            relief=1,
+            scale=(0.17, 1, 0.28),
+            pos=(-0.02, 0, -0.845),
+            command=self._cycle_shot_angle,
+            extraArgs=[-1],
+        )
+        self.angle_label = DirectLabel(
+            parent=self.ui,
+            text=self.shot_angle_choices[self.shot_angle_index][0],
+            text_fg=(0.78, 0.94, 1, 1),
+            text_scale=0.032,
+            frameColor=(0, 0, 0, 0),
+            pos=(0.16, 0, -0.845),
+        )
+        DirectButton(
+            parent=self.ui,
+            text=">",
+            text_scale=0.045,
+            frameColor=(0.12, 0.18, 0.24, 1),
+            text_fg=(1, 1, 1, 1),
+            relief=1,
+            scale=(0.17, 1, 0.28),
+            pos=(0.36, 0, -0.845),
+            command=self._cycle_shot_angle,
+            extraArgs=[1],
+        )
+
+    def _build_lights(self) -> None:
+        ambient = AmbientLight("ambient")
+        ambient.setColor((0.42, 0.45, 0.48, 1))
+        self.render.setLight(self.render.attachNewNode(ambient))
+
+        sun = DirectionalLight("sun")
+        sun.setColor((0.95, 0.92, 0.82, 1))
+        sun_np = self.render.attachNewNode(sun)
+        sun_np.setHpr(-40, -55, 0)
+        self.render.setLight(sun_np)
+
+    def _build_world(self) -> None:
+        self._make_surrounding_ground()
+        self._make_field()
+        self._make_goal()
+        self._make_sky()
+        self._make_clouds()
+        self._make_birds()
+        self._make_trees()
+
+    def _make_surrounding_ground(self) -> None:
+        cm = CardMaker("surrounding-ground")
+        cm.setFrame(-180, 180, -140, 140)
+        ground = self.render.attachNewNode(cm.generate())
+        ground.setP(-90)
+        ground.setZ(-0.015)
+        ground.setTexture(self._make_grass_texture(), 1)
+        ground.setColor(0.55, 0.68, 0.50, 1)
+
+    def _make_field(self) -> None:
+        cm = CardMaker("field")
+        cm.setFrame(-FIELD_LENGTH / 2, FIELD_LENGTH / 2, -FIELD_WIDTH / 2, FIELD_WIDTH / 2)
+        field = self.render.attachNewNode(cm.generate())
+        field.setP(-90)
+        field.setTexture(self._make_grass_texture(), 1)
+        field.setColor(1, 1, 1, 1)
+
+        stripe_count = 12
+        for i in range(stripe_count):
+            cm = CardMaker(f"stripe-{i}")
+            x0 = -FIELD_LENGTH / 2 + i * FIELD_LENGTH / stripe_count
+            x1 = -FIELD_LENGTH / 2 + (i + 1) * FIELD_LENGTH / stripe_count
+            cm.setFrame(x0, x1, -FIELD_WIDTH / 2, FIELD_WIDTH / 2)
+            stripe = self.render.attachNewNode(cm.generate())
+            stripe.setP(-90)
+            shade = 0.18 if i % 2 else 0.13
+            stripe.setColor(0.03, 0.32 + shade, 0.12, 0.35)
+            stripe.setTransparency(TransparencyAttrib.MAlpha)
+
+        lines = LineSegs("field-lines")
+        lines.setColor(1, 1, 1, 1)
+        lines.setThickness(2.2)
+        self._rect_line(lines, -FIELD_LENGTH / 2, FIELD_LENGTH / 2, -FIELD_WIDTH / 2, FIELD_WIDTH / 2, 0.025)
+        self._line(lines, 0, -FIELD_WIDTH / 2, 0, 0, FIELD_WIDTH / 2, 0)
+        self._circle(lines, 0, 0, 9.15)
+        self._rect_line(lines, GOAL_X - 16.5, GOAL_X, -20.16, 20.16, 0.03)
+        self._rect_line(lines, -GOAL_X, -GOAL_X + 16.5, -20.16, 20.16, 0.03)
+        self.render.attachNewNode(lines.create())
+        self._make_grass_detail()
+
+    def _make_grass_detail(self) -> None:
+        rng = random.Random(12)
+        grass = LineSegs("grass-detail")
+        grass.setThickness(1.0)
+        for _ in range(650):
+            x = rng.uniform(GOAL_X - 45.0, GOAL_X + 4.0)
+            y = rng.uniform(-FIELD_WIDTH / 2 + 1.0, FIELD_WIDTH / 2 - 1.0)
+            length = rng.uniform(0.28, 0.72)
+            shade = rng.uniform(0.30, 0.48)
+            grass.setColor(0.025, shade, 0.075, 0.42)
+            grass.moveTo(x, y, 0.045)
+            grass.drawTo(x + length, y + rng.uniform(-0.025, 0.025), 0.045)
+        grass_np = self.render.attachNewNode(grass.create())
+        grass_np.setTransparency(TransparencyAttrib.MAlpha)
+
+    def _make_grass_texture(self) -> Texture:
+        size = 256
+        image = PNMImage(size, size, 3)
+        rng = random.Random(31)
+        for y in range(size):
+            for x in range(size):
+                stripe = 0.055 if (x // 32) % 2 else -0.035
+                fine = 0.012 * math.sin(y * 0.45 + x * 0.05) + rng.uniform(-0.012, 0.012)
+                green = max(0.26, min(0.58, 0.39 + stripe + fine))
+                image.setXel(x, y, 0.028, green, 0.095)
+
+        for _ in range(700):
+            x = rng.randrange(size)
+            y = rng.randrange(size)
+            length = rng.randrange(6, 15)
+            shade = rng.uniform(0.34, 0.52)
+            for step in range(length):
+                px = min(size - 1, max(0, x + step))
+                py = min(size - 1, max(0, y + rng.randrange(-1, 2)))
+                image.setXel(px, py, 0.025, shade, 0.075)
+
+        texture = Texture("procedural-grass-texture")
+        texture.load(image)
+        return texture
+
+    def _make_goal(self) -> None:
+        white = (0.96, 0.96, 0.92, 1)
+        posts = [
+            ((GOAL_X, -GOAL_WIDTH / 2, 0), (GOAL_X, -GOAL_WIDTH / 2, GOAL_HEIGHT)),
+            ((GOAL_X, GOAL_WIDTH / 2, 0), (GOAL_X, GOAL_WIDTH / 2, GOAL_HEIGHT)),
+            ((GOAL_X, -GOAL_WIDTH / 2, GOAL_HEIGHT), (GOAL_X, GOAL_WIDTH / 2, GOAL_HEIGHT)),
+            ((GOAL_X + 2.0, -GOAL_WIDTH / 2, 0), (GOAL_X + 2.0, -GOAL_WIDTH / 2, GOAL_HEIGHT)),
+            ((GOAL_X + 2.0, GOAL_WIDTH / 2, 0), (GOAL_X + 2.0, GOAL_WIDTH / 2, GOAL_HEIGHT)),
+            ((GOAL_X, -GOAL_WIDTH / 2, GOAL_HEIGHT), (GOAL_X + 2.0, -GOAL_WIDTH / 2, GOAL_HEIGHT)),
+            ((GOAL_X, GOAL_WIDTH / 2, GOAL_HEIGHT), (GOAL_X + 2.0, GOAL_WIDTH / 2, GOAL_HEIGHT)),
+        ]
+        segs = LineSegs("goal")
+        segs.setThickness(7)
+        segs.setColor(*white)
+        for a, b in posts:
+            segs.moveTo(*a)
+            segs.drawTo(*b)
+        self.render.attachNewNode(segs.create())
+
+        net = LineSegs("goal-net")
+        net.setThickness(1)
+        net.setColor(0.85, 0.92, 0.95, 0.55)
+        for y_i in range(17):
+            y = -GOAL_WIDTH / 2 + y_i * GOAL_WIDTH / 16
+            net.moveTo(GOAL_NET_BACK_X, y, 0)
+            net.drawTo(GOAL_NET_BACK_X, y, GOAL_HEIGHT)
+        for z_i in range(9):
+            z = z_i * GOAL_HEIGHT / 8
+            net.moveTo(GOAL_NET_BACK_X, -GOAL_WIDTH / 2, z)
+            net.drawTo(GOAL_NET_BACK_X, GOAL_WIDTH / 2, z)
+        for y_i in range(17):
+            y = -GOAL_WIDTH / 2 + y_i * GOAL_WIDTH / 16
+            net.moveTo(GOAL_X, y, GOAL_HEIGHT)
+            net.drawTo(GOAL_NET_BACK_X, y, GOAL_HEIGHT)
+        for x_i in range(7):
+            x = GOAL_X + x_i * GOAL_NET_DEPTH / 6
+            net.moveTo(x, -GOAL_WIDTH / 2, GOAL_HEIGHT)
+            net.drawTo(x, GOAL_WIDTH / 2, GOAL_HEIGHT)
+        for side in (-1, 1):
+            y = side * GOAL_WIDTH / 2
+            for z_i in range(9):
+                z = z_i * GOAL_HEIGHT / 8
+                net.moveTo(GOAL_X, y, z)
+                net.drawTo(GOAL_NET_BACK_X, y, z)
+            for x_i in range(7):
+                x = GOAL_X + x_i * GOAL_NET_DEPTH / 6
+                net.moveTo(x, y, 0)
+                net.drawTo(x, y, GOAL_HEIGHT)
+        net_np = self.render.attachNewNode(net.create())
+        net_np.setTransparency(TransparencyAttrib.MAlpha)
+
+    def _make_sky(self) -> None:
+        cm = CardMaker("horizon")
+        cm.setFrame(-180, 180, 0, 70)
+        horizon = self.render.attachNewNode(cm.generate())
+        horizon.setPos(15, 95, 0)
+        horizon.setHpr(180, 0, 0)
+        horizon.setColor(0.52, 0.78, 1.0, 1)
+
+    def _make_clouds(self) -> None:
+        cloud_specs = [
+            (22, -18, 19, 1.55),
+            (43, -5, 23, 1.9),
+            (66, 14, 21, 1.65),
+            (84, -11, 27, 1.35),
+        ]
+        for cloud_i, (x, y, z, scale) in enumerate(cloud_specs):
+            cloud = NodePath(f"cloud-{cloud_i}")
+            cloud.reparentTo(self.render)
+            for puff_i, (dx, dz, size) in enumerate(((-2.1, 0.0, 1.0), (-0.8, 0.35, 1.35), (0.8, 0.2, 1.2), (2.0, 0.0, 0.95))):
+                puff = self._make_uv_sphere(f"cloud-{cloud_i}-puff-{puff_i}", 1.0, 16, 8)
+                puff.reparentTo(cloud)
+                puff.setScale(size * 4.8 * scale, 0.85 * scale, size * 1.25 * scale)
+                puff.setPos(dx * scale, 0, dz * scale)
+                puff.setColor(1.0, 1.0, 1.0, 0.72)
+                puff.setTransparency(TransparencyAttrib.MAlpha)
+            cloud.setPos(x, y, z)
+            self.clouds.append(cloud)
+
+    def _make_birds(self) -> None:
+        bird_specs = [(28, -11, 22, 0.62), (35, -8, 23, 0.48), (48, 7, 24, 0.55), (60, 10, 22, 0.46), (72, 4, 25, 0.52)]
+        for i, (x, y, z, scale) in enumerate(bird_specs):
+            bird_lines = LineSegs(f"bird-{i}")
+            bird_lines.setThickness(1.6)
+            bird_lines.setColor(0.03, 0.035, 0.04, 0.85)
+            bird_lines.moveTo(-0.9 * scale, 0, 0)
+            bird_lines.drawTo(-0.25 * scale, 0, 0.18 * scale)
+            bird_lines.drawTo(0, 0, 0.08 * scale)
+            bird_lines.drawTo(0.25 * scale, 0, 0.18 * scale)
+            bird_lines.drawTo(0.9 * scale, 0, 0)
+            bird = self.render.attachNewNode(bird_lines.create())
+            bird.setPos(x, y, z)
+            bird.setTransparency(TransparencyAttrib.MAlpha)
+            self.birds.append(bird)
+
+    def _make_trees(self) -> None:
+        for side in (-1, 1):
+            for i in range(26):
+                x = -55 + i * 4.6
+                y = side * (FIELD_WIDTH / 2 + 7 + (i % 4) * 1.9)
+                trunk_height = 2.4 + (i % 5) * 0.22
+                trunk = self._make_cylinder(f"tree-trunk-{side}-{i}", 0.14 + (i % 3) * 0.025, trunk_height, 12)
+                trunk.reparentTo(self.render)
+                trunk.setPos(x, y, trunk_height / 2)
+                trunk.setColor(0.38, 0.22, 0.10, 1)
+
+                crown = self._make_uv_sphere(f"tree-crown-{side}-{i}", 1.0, 16, 10)
+                crown.reparentTo(self.render)
+                crown.setScale(1.2 + (i % 4) * 0.18, 1.05 + (i % 3) * 0.16, 1.25 + (i % 5) * 0.12)
+                crown.setPos(x, y, trunk_height + 1.0)
+                crown.setColor(0.02, 0.24 + (i % 4) * 0.045, 0.09, 1)
+                if i % 3 == 0:
+                    crown2 = self._make_uv_sphere(f"tree-crown-extra-{side}-{i}", 1.0, 14, 8)
+                    crown2.reparentTo(self.render)
+                    crown2.setScale(0.95, 0.9, 0.95)
+                    crown2.setPos(x + 0.55, y + side * 0.35, trunk_height + 1.45)
+                    crown2.setColor(0.03, 0.34, 0.12, 1)
+
+    def _make_soccer_ball(self) -> NodePath:
+        ball = self._make_uv_sphere("soccer-ball", BALL_RADIUS, 64, 32)
+        ball.setTexture(self._make_ball_texture(), 1)
+        material = Material()
+        material.setDiffuse((0.96, 0.96, 0.92, 1))
+        material.setSpecular((0.28, 0.28, 0.25, 1))
+        material.setShininess(18)
+        ball.setMaterial(material, 1)
+        return ball
+
+    def _make_ball_texture(self) -> Texture:
+        size = 256
+        image = PNMImage(size, size, 3)
+        image.fill(0.93, 0.92, 0.86)
+
+        panels = [
+            (0.50, 0.50, 0.085, -90),
+            (0.18, 0.50, 0.070, -90),
+            (0.82, 0.50, 0.070, -90),
+            (0.32, 0.25, 0.070, -72),
+            (0.68, 0.25, 0.070, -108),
+            (0.32, 0.75, 0.070, -108),
+            (0.68, 0.75, 0.070, -72),
+            (0.04, 0.22, 0.060, -90),
+            (0.96, 0.78, 0.060, -90),
+        ]
+        seam_lines = [
+            (0.50, 0.50, 0.18),
+            (0.18, 0.50, 0.15),
+            (0.82, 0.50, 0.15),
+            (0.32, 0.25, 0.15),
+            (0.68, 0.25, 0.15),
+            (0.32, 0.75, 0.15),
+            (0.68, 0.75, 0.15),
+        ]
+        panel_polygons = []
+        for cx, cy, radius, rotation in panels:
+            for wrapped_cx in (cx - 1.0, cx, cx + 1.0):
+                polygon = self._regular_polygon_uv(wrapped_cx, cy, radius, 5, rotation)
+                min_x = min(point[0] for point in polygon) - 0.006
+                max_x = max(point[0] for point in polygon) + 0.006
+                min_y = min(point[1] for point in polygon) - 0.006
+                max_y = max(point[1] for point in polygon) + 0.006
+                panel_polygons.append((polygon, min_x, max_x, min_y, max_y))
+
+        for y in range(size):
+            for x in range(size):
+                u = x / size
+                v = y / size
+                black = False
+                seam = False
+
+                for polygon, min_x, max_x, min_y, max_y in panel_polygons:
+                    if not (min_x <= u <= max_x and min_y <= v <= max_y):
+                        continue
+                    if self._point_in_polygon(u, v, polygon):
+                        black = True
+                    if self._distance_to_poly_edges(u, v, polygon) < 0.0045:
+                        seam = True
+
+                for cx, cy, radius in seam_lines:
+                    dx = min(abs(u - cx), 1.0 - abs(u - cx))
+                    dy = (v - cy) * 1.18
+                    distance = math.sqrt(dx * dx + dy * dy)
+                    if abs(distance - radius) < 0.0038:
+                        seam = True
+
+                panel_noise = 0.012 * math.sin(u * 67.0 + v * 29.0) + 0.009 * math.sin(u * 19.0 - v * 53.0)
+                if black:
+                    highlight = 0.018 * math.sin(u * 41.0) + 0.014 * math.cos(v * 37.0)
+                    shade = max(0.015, min(0.055, 0.032 + highlight))
+                    image.setXel(x, y, shade, shade, shade)
+                elif seam:
+                    image.setXel(x, y, 0.08, 0.075, 0.065)
+                else:
+                    base = max(0.84, min(0.98, 0.925 + panel_noise))
+                    image.setXel(x, y, base, base * 0.995, base * 0.94)
+
+        texture = Texture("procedural-soccer-texture")
+        texture.load(image)
+        return texture
+
+    @staticmethod
+    def _regular_polygon_uv(cx: float, cy: float, radius: float, sides: int, rotation_deg: float) -> list[Tuple[float, float]]:
+        rotation = math.radians(rotation_deg)
+        return [
+            (
+                cx + math.cos(rotation + 2.0 * math.pi * i / sides) * radius,
+                cy + math.sin(rotation + 2.0 * math.pi * i / sides) * radius,
+            )
+            for i in range(sides)
+        ]
+
+    @staticmethod
+    def _point_in_polygon(x: float, y: float, polygon: list[Tuple[float, float]]) -> bool:
+        inside = False
+        j = len(polygon) - 1
+        for i, (xi, yi) in enumerate(polygon):
+            xj, yj = polygon[j]
+            intersects = (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / max(0.000001, yj - yi) + xi
+            if intersects:
+                inside = not inside
+            j = i
+        return inside
+
+    @classmethod
+    def _distance_to_poly_edges(cls, x: float, y: float, polygon: list[Tuple[float, float]]) -> float:
+        closest = 999.0
+        for i, start in enumerate(polygon):
+            end = polygon[(i + 1) % len(polygon)]
+            closest = min(closest, cls._distance_to_segment(x, y, start, end))
+        return closest
+
+    @staticmethod
+    def _distance_to_segment(x: float, y: float, start: Tuple[float, float], end: Tuple[float, float]) -> float:
+        x1, y1 = start
+        x2, y2 = end
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0.000001:
+            return math.sqrt((x - x1) ** 2 + (y - y1) ** 2)
+        t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / length_sq))
+        px = x1 + t * dx
+        py = y1 + t * dy
+        return math.sqrt((x - px) ** 2 + (y - py) ** 2)
+
+    def _make_uv_sphere(self, name: str, radius: float, segs: int, rings: int) -> NodePath:
+        fmt = GeomVertexFormat.getV3n3t2()
+        vdata = GeomVertexData(name, fmt, Geom.UHStatic)
+        vertex = GeomVertexWriter(vdata, "vertex")
+        normal = GeomVertexWriter(vdata, "normal")
+        texcoord = GeomVertexWriter(vdata, "texcoord")
+
+        for r in range(rings + 1):
+            theta = math.pi * r / rings
+            z = math.cos(theta)
+            ring_radius = math.sin(theta)
+            for s in range(segs + 1):
+                phi = 2 * math.pi * s / segs
+                x = ring_radius * math.cos(phi)
+                y = ring_radius * math.sin(phi)
+                vertex.addData3(radius * x, radius * y, radius * z)
+                normal.addData3(x, y, z)
+                texcoord.addData2(s / segs, 1 - r / rings)
+
+        tris = GeomTriangles(Geom.UHStatic)
+        for r in range(rings):
+            for s in range(segs):
+                i0 = r * (segs + 1) + s
+                i1 = i0 + 1
+                i2 = i0 + segs + 1
+                i3 = i2 + 1
+                tris.addVertices(i0, i2, i1)
+                tris.addVertices(i1, i2, i3)
+
+        geom = Geom(vdata)
+        geom.addPrimitive(tris)
+        node = GeomNode(name)
+        node.addGeom(geom)
+        return NodePath(node)
+
+    def _make_cylinder(self, name: str, radius: float, height: float, segs: int) -> NodePath:
+        fmt = GeomVertexFormat.getV3n3t2()
+        vdata = GeomVertexData(name, fmt, Geom.UHStatic)
+        vertex = GeomVertexWriter(vdata, "vertex")
+        normal = GeomVertexWriter(vdata, "normal")
+        texcoord = GeomVertexWriter(vdata, "texcoord")
+
+        for z_index, z in enumerate((-height / 2, height / 2)):
+            for s in range(segs + 1):
+                angle = 2 * math.pi * s / segs
+                x = math.cos(angle)
+                y = math.sin(angle)
+                vertex.addData3(radius * x, radius * y, z)
+                normal.addData3(x, y, 0)
+                texcoord.addData2(s / segs, z_index)
+
+        bottom_center = vertex.getWriteRow()
+        vertex.addData3(0, 0, -height / 2)
+        normal.addData3(0, 0, -1)
+        texcoord.addData2(0.5, 0.5)
+        top_center = vertex.getWriteRow()
+        vertex.addData3(0, 0, height / 2)
+        normal.addData3(0, 0, 1)
+        texcoord.addData2(0.5, 0.5)
+
+        tris = GeomTriangles(Geom.UHStatic)
+        ring = segs + 1
+        for s in range(segs):
+            i0 = s
+            i1 = s + 1
+            i2 = ring + s
+            i3 = ring + s + 1
+            tris.addVertices(i0, i1, i2)
+            tris.addVertices(i1, i3, i2)
+            tris.addVertices(bottom_center, i0, i1)
+            tris.addVertices(top_center, i3, i2)
+
+        geom = Geom(vdata)
+        geom.addPrimitive(tris)
+        node = GeomNode(name)
+        node.addGeom(geom)
+        return NodePath(node)
+
+    def _start_shot(self, shot: ShotData) -> None:
+        shot.speed_mps = max(3.0, min(55.0, shot.speed_mps))
+        shot.launch_angle_deg = max(0.0, min(45.0, shot.launch_angle_deg))
+        self._clear_trajectory()
+        self.ball_start_pos = self._ball_position_from_shot(shot)
+        if shot.direction_relative_to_goal:
+            shot.direction_deg += self._direction_from_ball_to_goal(self.ball_start_pos)
+        shot.direction_deg = max(-180.0, min(180.0, shot.direction_deg))
+        shot.spin_rpm = max(-2500.0, min(2500.0, shot.spin_rpm))
+        shot.side_spin_rpm = max(-2500.0, min(2500.0, shot.side_spin_rpm))
+
+        launch = math.radians(shot.launch_angle_deg)
+        direction = math.radians(shot.direction_deg)
+        horizontal = shot.speed_mps * math.cos(launch)
+        self.velocity = Vec3(
+            horizontal * math.cos(direction),
+            horizontal * math.sin(direction),
+            shot.speed_mps * math.sin(launch),
+        )
+        self.ball.setPos(self.ball_start_pos)
+        self.previous_ball_pos = Vec3(self.ball_start_pos)
+        self.trajectory_points.append(Vec3(self.ball_start_pos))
+        self.ball.setHpr(0, 0, 0)
+        self._update_direction_indicator(shot.direction_deg)
+        self.flight_time = 0.0
+        self.shot_active = True
+        self.goal_line_passed = self.ball_start_pos.x >= GOAL_X - 0.1
+        self.ball_landed = False
+        self.goal_crossing_was_goal = False
+        self.goal_scored = False
+        self.net_contacted = False
+        self.last_shot = shot
+        self.goal_result = ""
+        self.status_since = time.time()
+        self.status_label["text"] = "Ball kicked - tracking shot in FPV"
+        self.telemetry_label["text"] = (
+            f"UDP :{UDP_PORT}   Speed {shot.speed_mps:.1f} m/s   "
+            f"Launch {shot.launch_angle_deg:.1f} deg   Dir {shot.direction_deg:.0f} deg   "
+            f"Pos {self._shot_distance_label(shot)}   "
+            f"Spin {shot.spin_rpm:.0f}/{shot.side_spin_rpm:.0f} rpm"
+        )
+
+    def _update(self, task):
+        dt = globalClock.getDt()
+        self._drain_udp_queue()
+        self._animate_birds()
+
+        if self.shot_active:
+            self._step_ball(dt)
+        elif self.replay_active:
+            self._update_bird_view_replay(dt)
+        else:
+            self._maybe_start_random_shot()
+            pulse = 0.55 + 0.45 * abs(math.sin(time.time() * 3.0))
+            self.status_label["text_fg"] = (1.0, 0.86 + 0.14 * pulse, 0.32, 1)
+            self._idle_camera(dt)
+
+        return task.cont
+
+    def _animate_birds(self) -> None:
+        t = time.time()
+        for i, bird in enumerate(self.birds):
+            bird.setX(bird.getX() + 0.006 + i * 0.0007)
+            bird.setZ(bird.getZ() + math.sin(t * 2.2 + i) * 0.002)
+            bird.setR(math.sin(t * 4.2 + i) * 3.0)
+            if bird.getX() > FIELD_LENGTH / 2 + 30:
+                bird.setX(24)
+
+    def _drain_udp_queue(self) -> None:
+        newest_debug = None
+        while True:
+            try:
+                newest_debug = self.udp_debug_queue.get_nowait()
+            except queue.Empty:
+                break
+        if newest_debug and not self.shot_active and not self.replay_active:
+            self.status_label["text"] = newest_debug
+            self.status_label["text_fg"] = (0.76, 0.92, 1.0, 1)
+            self.telemetry_label["text"] = f"UDP :{UDP_PORT}   {newest_debug}"
+
+        newest = None
+        while True:
+            try:
+                newest = self.shot_queue.get_nowait()
+            except queue.Empty:
+                break
+        if newest:
+            self._start_shot(newest)
+
+    def _step_ball(self, dt: float) -> None:
+        dt = min(dt, 1 / 30) * 0.8
+        shot = self.last_shot or ShotData(20, 16)
+        pos = self.ball.getPos()
+        previous_pos = Vec3(pos)
+
+        accel = self._magnus_acceleration(shot)
+
+        self.velocity += accel * dt
+        pos += self.velocity * dt
+        self._apply_goal_net_collision(pos)
+
+        ground_hit = pos.z <= BALL_RADIUS and self.velocity.z < 0
+        if ground_hit:
+            self.ball_landed = True
+            pos.z = BALL_RADIUS
+            self.velocity.z *= -0.34
+            self.velocity.x *= 0.78
+            self.velocity.y *= 0.80
+
+        self.ball.setPos(pos)
+        if not self.trajectory_points or (pos - self.trajectory_points[-1]).length() > 0.45:
+            self.trajectory_points.append(Vec3(pos))
+        spin_degrees = self.velocity.length() / (2 * math.pi * BALL_RADIUS) * 360 * dt
+        self.ball.setP(self.ball.getP() + spin_degrees)
+        self.ball.setH(self.ball.getH() + shot.side_spin_rpm * 6.0 * dt)
+        self.flight_time += dt
+
+        self._follow_ball_camera(dt)
+        self._check_goal_or_stop(previous_pos, pos)
+        self.previous_ball_pos = Vec3(pos)
+
+    def _magnus_acceleration(self, shot: ShotData) -> Vec3:
+        horizontal_velocity = Vec3(self.velocity.x, self.velocity.y, 0)
+        horizontal_speed = horizontal_velocity.length()
+        accel = Vec3(0, 0, -GRAVITY)
+        if horizontal_speed < 0.01:
+            return accel
+
+        forward = Vec3(horizontal_velocity)
+        forward.normalize()
+        right = Vec3(-forward.y, forward.x, 0)
+
+        side_spin_ratio = max(-1.0, min(1.0, shot.side_spin_rpm / 1800.0))
+        backspin_ratio = max(-1.0, min(1.0, shot.spin_rpm / 2200.0))
+        curl_strength = side_spin_ratio * horizontal_speed * 0.34
+        lift_strength = abs(backspin_ratio) * horizontal_speed * 0.16
+        drag_strength = min(1.8, horizontal_speed * 0.018)
+
+        accel += right * curl_strength
+        accel += Vec3(0, 0, lift_strength)
+        accel -= forward * drag_strength
+        return accel
+
+    def _apply_goal_net_collision(self, pos: Vec3) -> None:
+        in_goal_mouth = abs(pos.y) <= GOAL_WIDTH / 2 + BALL_RADIUS and BALL_RADIUS <= pos.z <= GOAL_HEIGHT + BALL_RADIUS
+        if not in_goal_mouth or pos.x < GOAL_X:
+            return
+
+        net_back_x = GOAL_NET_BACK_X - BALL_RADIUS
+        if pos.x >= net_back_x:
+            pos.x = net_back_x
+            if self.velocity.x > 0:
+                self.velocity.x *= -0.10
+            self.velocity.y *= 0.45
+            self.velocity.z *= 0.45
+            self.net_contacted = True
+            return
+
+        if not self.net_contacted:
+            self.velocity.x *= 0.22
+            self.velocity.y *= 0.55
+            self.velocity.z *= 0.60
+            self.net_contacted = True
+
+        side_limit = GOAL_WIDTH / 2 - BALL_RADIUS
+        if pos.y > side_limit:
+            pos.y = side_limit
+            self.velocity.y = min(0.0, self.velocity.y) * 0.25
+        elif pos.y < -side_limit:
+            pos.y = -side_limit
+            self.velocity.y = max(0.0, self.velocity.y) * 0.25
+
+        top_limit = GOAL_HEIGHT - BALL_RADIUS
+        if pos.z > top_limit:
+            pos.z = top_limit
+            self.velocity.z = min(0.0, self.velocity.z) * 0.25
+
+    def _check_goal_or_stop(self, previous_pos: Vec3, pos: Vec3) -> None:
+        crossed_goal_plane, entered_goal = self._goal_plane_crossing(previous_pos, pos)
+        in_goal = entered_goal or (
+            abs(pos.x - GOAL_X) <= 0.45
+            and abs(pos.y) <= GOAL_WIDTH / 2
+            and BALL_RADIUS < pos.z <= GOAL_HEIGHT
+        )
+        if in_goal and not self.goal_scored:
+            self.goal_scored = True
+            self.goal_result = "Goal!"
+            self.status_label["text"] = self.goal_result
+            self.status_label["text_fg"] = (0.20, 1.0, 0.42, 1)
+
+        if not self.goal_line_passed and (in_goal or crossed_goal_plane):
+            self.goal_line_passed = True
+            self.goal_crossing_was_goal = in_goal
+            self.goal_result = "Goal!" if self.goal_scored else "Missed - waiting for ball to land"
+            self.status_label["text"] = self.goal_result
+            self.status_label["text_fg"] = (0.20, 1.0, 0.42, 1) if self.goal_scored else (1.0, 0.64, 0.28, 1)
+
+        net_back_reached = (
+            previous_pos.x < GOAL_NET_BACK_X <= pos.x
+            or pos.x >= GOAL_NET_BACK_X
+            or (self.net_contacted and pos.x >= GOAL_NET_BACK_X - BALL_RADIUS - 0.01)
+        )
+        if net_back_reached:
+            if self.goal_scored:
+                self.goal_result = "Goal!"
+                self.status_label["text"] = self.goal_result
+                self.status_label["text_fg"] = (0.20, 1.0, 0.42, 1)
+            else:
+                self.goal_result = "Shot passed behind the net - replaying"
+                self.status_label["text"] = self.goal_result
+                self.status_label["text_fg"] = (1.0, 0.64, 0.28, 1)
+            self.shot_active = False
+            self.status_since = time.time()
+            self._start_bird_view_replay()
+            return
+
+        ball_stopped = self.ball_landed and self.velocity.length() < 0.45
+        if self.goal_line_passed and ball_stopped:
+            if self.goal_scored:
+                self.goal_result = "Goal!"
+                self.status_label["text"] = self.goal_result
+                self.status_label["text_fg"] = (0.20, 1.0, 0.42, 1)
+            elif not self.goal_result or self.goal_result.startswith("Missed"):
+                self.goal_result = "Missed - replaying after landing"
+                self.status_label["text"] = self.goal_result
+                self.status_label["text_fg"] = (1.0, 0.38, 0.28, 1)
+            self.shot_active = False
+            self.status_since = time.time()
+            self._start_bird_view_replay()
+        elif self.flight_time > 18.0 or (ball_stopped and not self.goal_line_passed):
+            self.status_label["text"] = "Shot finished - kick the ball again"
+            self.status_label["text_fg"] = (1.0, 0.86, 0.32, 1)
+            self.shot_active = False
+            self.status_since = time.time()
+            self._start_bird_view_replay()
+
+    @staticmethod
+    def _goal_plane_crossing(previous_pos: Vec3, pos: Vec3) -> Tuple[bool, bool]:
+        dx0 = previous_pos.x - GOAL_X
+        dx1 = pos.x - GOAL_X
+        crossed = dx0 == 0 or dx1 == 0 or (dx0 < 0 < dx1) or (dx1 < 0 < dx0)
+        if not crossed:
+            return False, False
+
+        segment_dx = pos.x - previous_pos.x
+        if abs(segment_dx) < 0.0001:
+            t = 0.0
+        else:
+            t = max(0.0, min(1.0, (GOAL_X - previous_pos.x) / segment_dx))
+        y_at_goal = previous_pos.y + (pos.y - previous_pos.y) * t
+        z_at_goal = previous_pos.z + (pos.z - previous_pos.z) * t
+        entered_goal = abs(y_at_goal) <= GOAL_WIDTH / 2 and BALL_RADIUS < z_at_goal <= GOAL_HEIGHT
+        return True, entered_goal
+
+    def _follow_ball_camera(self, dt: float) -> None:
+        if not self.camera:
+            return
+        ball_pos = self.ball.getPos()
+        direction = Vec3(self.velocity.x, self.velocity.y, max(self.velocity.z * 0.25, 0.0))
+        if direction.length() < 0.01:
+            direction = Vec3(1, 0, 0)
+        direction.normalize()
+
+        desired = ball_pos - direction * 2.2 + Vec3(0, 0, 0.75)
+        current = self.camera.getPos()
+        blend = min(1.0, dt * 7.5)
+        self.camera.setPos(current + (desired - current) * blend)
+        self.camera.lookAt(ball_pos + direction * 4.0 + Vec3(0, 0, 0.45))
+
+    def _start_bird_view_replay(self) -> None:
+        if len(self.trajectory_points) < 2:
+            self._schedule_next_random_shot()
+            return
+
+        self.replay_active = True
+        self.replay_started_at = time.time()
+        self.replay_draw_index = 1
+        self.replay_draw_progress = 1.0
+        self._clear_trajectory_line_only()
+        self.status_label["text"] = "Goal! - 3D slow-motion replay" if self.goal_scored else "3D slow-motion bird view replay"
+        self.status_label["text_fg"] = (0.76, 0.92, 1.0, 1)
+        self._set_sky_details_visible(False)
+        self._set_bird_view_camera()
+
+    def _update_bird_view_replay(self, dt: float) -> None:
+        if not self.camera:
+            return
+
+        self._set_bird_view_camera()
+        self.replay_draw_progress = min(len(self.trajectory_points), self.replay_draw_progress + 14.0 * dt)
+        self.replay_draw_index = max(1, int(self.replay_draw_progress))
+        self._draw_trajectory(self.replay_draw_index)
+
+        current = self.trajectory_points[self.replay_draw_index - 1]
+        self.ball.setPos(current)
+        self.ball.setZ(max(BALL_RADIUS, current.z))
+
+        if self.replay_draw_index >= len(self.trajectory_points) and time.time() - self.replay_started_at > 2.0:
+            self.replay_active = False
+            self.status_label["text"] = "Trajectory replay complete - kick the ball again"
+            self.status_label["text_fg"] = (1.0, 0.9, 0.35, 1)
+            self._set_sky_details_visible(True)
+            self._schedule_next_random_shot(delay=3.0)
+
+    def _set_bird_view_camera(self) -> None:
+        if not self.camera:
+            return
+        min_x = min(point.x for point in self.trajectory_points)
+        max_x = max(point.x for point in self.trajectory_points)
+        min_y = min(point.y for point in self.trajectory_points)
+        max_y = max(point.y for point in self.trajectory_points)
+        max_z = max(point.z for point in self.trajectory_points)
+        center = Vec3((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, max(1.0, max_z * 0.35))
+        span = max(max_x - min_x, max_y - min_y, 32.0)
+        height = min(110.0, max(42.0, span * 1.45 + max_z * 2.0))
+        self.camera.setPos(center.x - span * 0.18, center.y - span * 0.22, height)
+        self.camera.lookAt(center)
+
+    def _draw_trajectory(self, count: int) -> None:
+        self._clear_trajectory_line_only()
+        if count < 2:
+            return
+
+        lines = LineSegs("bird-view-trajectory")
+        lines.setThickness(4.0)
+        lines.setColor(1.0, 0.18, 0.12, 1.0)
+        first = self.trajectory_points[0]
+        lines.moveTo(first.x, first.y, max(0.18, first.z))
+        for point in self.trajectory_points[1:count]:
+            lines.drawTo(point.x, point.y, max(0.18, point.z))
+        self.trajectory_line_np = self.render.attachNewNode(lines.create())
+
+    def _clear_trajectory(self) -> None:
+        self.trajectory_points = []
+        self.replay_active = False
+        self.replay_draw_index = 0
+        self.replay_draw_progress = 0.0
+        self._set_sky_details_visible(True)
+        self._clear_trajectory_line_only()
+
+    def _clear_trajectory_line_only(self) -> None:
+        if self.trajectory_line_np:
+            self.trajectory_line_np.removeNode()
+            self.trajectory_line_np = None
+
+    def _set_sky_details_visible(self, visible: bool) -> None:
+        for node in self.clouds + self.birds:
+            if visible:
+                node.show()
+            else:
+                node.hide()
+
+    def _idle_camera(self, dt: float) -> None:
+        if not self.camera:
+            return
+        desired, target = self._pre_kick_camera_pose(wiggle=True)
+        self.camera.setPos(self.camera.getPos() + (desired - self.camera.getPos()) * min(1.0, dt * 2.0))
+        self.camera.lookAt(target)
+
+    def _reset_camera(self) -> None:
+        if not self.camera:
+            return
+        desired, target = self._pre_kick_camera_pose(wiggle=False)
+        self.camera.setPos(desired)
+        self.camera.lookAt(target)
+
+    def _update_direction_indicator(self, direction_deg: float) -> None:
+        if self.direction_line_np:
+            self.direction_line_np.removeNode()
+
+        direction = math.radians(direction_deg)
+        forward = Vec3(math.cos(direction), math.sin(direction), 0)
+        right = Vec3(-forward.y, forward.x, 0)
+        start = Vec3(self.ball_start_pos.x, self.ball_start_pos.y, 0.09)
+        length = min(14.0, max(5.0, self.shot_distance_m * 0.32))
+        end = start + forward * length
+
+        lines = LineSegs("initial-direction")
+        lines.setThickness(4.0)
+        lines.setColor(1.0, 0.86, 0.12, 1.0)
+        lines.moveTo(start)
+        lines.drawTo(end)
+        lines.moveTo(end)
+        lines.drawTo(end - forward * 1.25 + right * 0.65)
+        lines.moveTo(end)
+        lines.drawTo(end - forward * 1.25 - right * 0.65)
+        self.direction_line_np = self.render.attachNewNode(lines.create())
+
+    def _pre_kick_camera_pose(self, wiggle: bool) -> Tuple[Vec3, Vec3]:
+        distance = 4.0
+        to_goal = Vec3(GOAL_X - self.ball_start_pos.x, -self.ball_start_pos.y, 0)
+        if to_goal.length() < 0.001:
+            to_goal = Vec3(1, 0, 0)
+        to_goal.normalize()
+        lateral = Vec3(-to_goal.y, to_goal.x, 0)
+        behind_offset = -to_goal * distance + Vec3(0, 0, 1.8)
+
+        wiggle_pos = Vec3(0, 0, 0)
+        wiggle_target = Vec3(0, 0, 0)
+        if wiggle:
+            t = time.time()
+            wiggle_pos = lateral * (math.sin(t * 1.35) * 0.12) + Vec3(0, 0, math.sin(t * 1.9) * 0.035)
+            wiggle_target = lateral * (math.sin(t * 1.1) * 0.18) + Vec3(0, 0, math.sin(t * 1.6) * 0.04)
+
+        camera_pos = self.ball_start_pos + behind_offset + wiggle_pos
+        target = Vec3(GOAL_X, 0, GOAL_HEIGHT * 0.55) + wiggle_target
+        return camera_pos, target
+
+    def _reset_ball(self) -> None:
+        self.ball_start_pos = self._ball_position_from_selected_controls()
+        self.ball.setPos(self.ball_start_pos)
+        self.previous_ball_pos = Vec3(self.ball_start_pos)
+        self.ball.setHpr(0, 0, 0)
+        self.velocity = Vec3(0, 0, 0)
+        self.shot_active = False
+        self.goal_line_passed = False
+        self.ball_landed = False
+        self.goal_crossing_was_goal = False
+        self.goal_scored = False
+        self.net_contacted = False
+        self._clear_trajectory()
+        self.goal_result = ""
+        self.status_label["text"] = self._waiting_status_text()
+        self.status_label["text_fg"] = (1.0, 0.9, 0.35, 1)
+        self.telemetry_label["text"] = f"UDP :{UDP_PORT}   Speed -- m/s   Launch -- deg   Dir -- deg   Spin -- rpm"
+        self._schedule_next_random_shot(delay=0.8)
+        self._reset_camera()
+        self._update_direction_indicator(self._direction_from_ball_to_goal(self.ball_start_pos))
+
+    def _demo_shot(self) -> None:
+        self._start_shot(self._shot_from_selected_controls(spin_rpm=900.0, side_spin_rpm=850.0))
+
+    def _cycle_shot_distance(self, direction: int) -> None:
+        self.shot_distance_index = (self.shot_distance_index + direction) % len(self.shot_distance_choices)
+        self.shot_distance_m = self.shot_distance_choices[self.shot_distance_index][1]
+        self.distance_label["text"] = self.shot_distance_choices[self.shot_distance_index][0]
+        if not self.shot_active:
+            self._reset_ball()
+
+    def _cycle_shot_angle(self, direction: int) -> None:
+        self.shot_angle_index = (self.shot_angle_index + direction) % len(self.shot_angle_choices)
+        self.shot_angle_deg = self.shot_angle_choices[self.shot_angle_index][1]
+        self.angle_label["text"] = self.shot_angle_choices[self.shot_angle_index][0]
+        if not self.shot_active:
+            self._reset_ball()
+
+    def _shot_from_selected_controls(self, spin_rpm: float, side_spin_rpm: float) -> ShotData:
+        launch_angle_deg = 15.0
+        speed = self._speed_for_target_distance(self.shot_distance_m, launch_angle_deg)
+        direction = self._direction_from_ball_to_goal(self.ball_start_pos)
+        return ShotData(
+            speed_mps=speed,
+            launch_angle_deg=launch_angle_deg,
+            direction_deg=direction,
+            spin_rpm=spin_rpm,
+            side_spin_rpm=side_spin_rpm,
+            ball_distance_m=self.shot_distance_m,
+            ball_position_angle_deg=self.shot_angle_deg,
+        )
+
+    def _ball_position_from_selected_controls(self) -> Vec3:
+        return self._ball_position_from_distance_angle(self.shot_distance_m, self.shot_angle_deg)
+
+    def _ball_position_from_shot(self, shot: ShotData) -> Vec3:
+        if shot.ball_distance_m is None or shot.ball_position_angle_deg is None:
+            return self._ball_position_from_selected_controls()
+        return self._ball_position_from_distance_angle(
+            max(1.0, min(140.0, shot.ball_distance_m)),
+            max(0.0, min(180.0, shot.ball_position_angle_deg)),
+        )
+
+    @staticmethod
+    def _ball_position_from_distance_angle(distance_m: float, angle_deg: float) -> Vec3:
+        angle = math.radians(angle_deg)
+        direction_from_ball_to_goal = Vec3(math.sin(angle), math.cos(angle), 0)
+        goal_ground = Vec3(GOAL_X, 0, BALL_RADIUS)
+        return goal_ground - direction_from_ball_to_goal * distance_m
+
+    def _shot_distance_label(self, shot: ShotData) -> str:
+        distance = shot.ball_distance_m if shot.ball_distance_m is not None else self.shot_distance_m
+        angle = shot.ball_position_angle_deg if shot.ball_position_angle_deg is not None else self.shot_angle_deg
+        return f"{distance:.0f} m/{angle:.0f} deg"
+
+    @staticmethod
+    def _direction_from_ball_to_goal(ball_pos: Vec3) -> float:
+        to_goal = Vec3(GOAL_X - ball_pos.x, -ball_pos.y, 0)
+        if to_goal.length() < 0.001:
+            return 0.0
+        return math.degrees(math.atan2(to_goal.y, to_goal.x))
+
+    @staticmethod
+    def _speed_for_target_distance(distance_m: float, launch_angle_deg: float) -> float:
+        angle = math.radians(max(1.0, min(44.0, launch_angle_deg)))
+        denominator = max(0.05, math.sin(2.0 * angle))
+        return math.sqrt(max(1.0, distance_m) * GRAVITY / denominator)
+
+    def _toggle_random_loop(self) -> None:
+        self.random_loop_enabled = False
+        self.random_button["text"] = "UDP Listen"
+        self.random_button["frameColor"] = (0.13, 0.30, 0.54, 1)
+        self.status_label["text"] = "Waiting for randomized ESP32 UDP kick packets"
+
+    def _maybe_start_random_shot(self) -> None:
+        if not self.random_loop_enabled or self.shot_active or time.time() < self.next_random_shot_at:
+            return
+
+        packet = self._generate_random_kick_packet()
+        shot = UdpKickListener._parse_packet(packet)
+        if shot:
+            self._start_shot(shot)
+            self.status_label["text"] = "Random ESP32 kick packet generated"
+
+    def _schedule_next_random_shot(self, delay: Optional[float] = None) -> None:
+        wait_time = delay if delay is not None else random.uniform(1.1, 2.4)
+        self.next_random_shot_at = time.time() + wait_time
+
+    def _generate_random_kick_packet(self) -> str:
+        selected_shot = self._shot_from_selected_controls(spin_rpm=0.0, side_spin_rpm=0.0)
+        speed = selected_shot.speed_mps * random.uniform(0.94, 1.06)
+        launch_angle = selected_shot.launch_angle_deg + random.uniform(-2.0, 2.0)
+        direction = selected_shot.direction_deg + random.uniform(-12.0, 12.0)
+        spin = random.triangular(100.0, 2100.0, 850.0)
+        side_spin = random.triangular(-1400.0, 1400.0, 0.0)
+
+        packet = {
+            "kicked": True,
+            "speed_mps": round(speed, 2),
+            "launch_angle_deg": round(launch_angle, 2),
+            "direction_deg": round(max(-180.0, min(180.0, direction)), 2),
+            "spin_rpm": round(spin, 1),
+            "side_spin_rpm": round(max(-1400.0, min(1400.0, side_spin)), 1),
+        }
+        return json.dumps(packet)
+
+    def _waiting_status_text(self) -> str:
+        if self.udp_error:
+            return f"UDP listener unavailable ({self.udp_error}) - Demo Shot still works"
+        return "Kick the ball - waiting for ESP32 UDP signal"
+
+    @staticmethod
+    def _line(lines: LineSegs, x0: float, y0: float, z0: float, x1: float, y1: float, z1: float) -> None:
+        lines.moveTo(x0, y0, z0)
+        lines.drawTo(x1, y1, z1)
+
+    @staticmethod
+    def _rect_line(lines: LineSegs, x0: float, x1: float, y0: float, y1: float, z: float) -> None:
+        lines.moveTo(x0, y0, z)
+        lines.drawTo(x1, y0, z)
+        lines.drawTo(x1, y1, z)
+        lines.drawTo(x0, y1, z)
+        lines.drawTo(x0, y0, z)
+
+    @staticmethod
+    def _circle(lines: LineSegs, x: float, y: float, radius: float) -> None:
+        steps = 96
+        for i in range(steps + 1):
+            a = 2 * math.pi * i / steps
+            px = x + math.cos(a) * radius
+            py = y + math.sin(a) * radius
+            if i == 0:
+                lines.moveTo(px, py, 0.04)
+            else:
+                lines.drawTo(px, py, 0.04)
+
+
+if __name__ == "__main__":
+    app = SoccerFpvSimulator()
+    app.run()
