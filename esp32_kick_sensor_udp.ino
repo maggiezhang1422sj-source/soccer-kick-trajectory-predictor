@@ -6,9 +6,9 @@
 #include "ICM_20948.h"  // Install "SparkFun 9DoF IMU Breakout - ICM 20948 - Arduino Library"
 
 // ---------- User configuration ----------
-const char* WIFI_SSID = "YOUR_WIFI_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char* MAC_IP = "YOUR_MAC_IP";
+const char* WIFI_SSID = "ATTz42RXr5";
+const char* WIFI_PASSWORD = "t8z%#dhu+2v8";
+const char* MAC_IP = "192.168.1.237";
 const uint16_t MAC_UDP_PORT = 4210;
 const uint16_t MAC_TCP_PORT = 4210;
 const bool SEND_TCP_DIRECT = true;  // TCP is reliable but requires MAC_IP to be current.
